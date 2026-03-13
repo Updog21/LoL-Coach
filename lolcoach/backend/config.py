@@ -43,10 +43,22 @@ DATABASE_URL = f"sqlite:///{DB_PATH}"
 CHROMA_DIR = DATA_DIR / "chroma"
 
 # ---------------------------------------------------------------------------
-# Riot Live Client API
+# Riot Live Client API (in-game)
 # ---------------------------------------------------------------------------
 RIOT_API_BASE = "https://127.0.0.1:2999"
 RIOT_POLL_INTERVAL = 5.0  # seconds
+
+# ---------------------------------------------------------------------------
+# LCU (League Client) — champ select
+# ---------------------------------------------------------------------------
+LCU_POLL_INTERVAL = 2.0  # seconds — champ select is time-sensitive
+LCU_LOCKFILE_PATHS = [
+    # Default Riot install locations
+    r"C:\Riot Games\League of Legends\lockfile",
+    r"D:\Riot Games\League of Legends\lockfile",
+    r"C:\Program Files\Riot Games\League of Legends\lockfile",
+    r"C:\Program Files (x86)\Riot Games\League of Legends\lockfile",
+]
 
 # ---------------------------------------------------------------------------
 # AI defaults
@@ -79,3 +91,14 @@ TIMESTAMP_WINDOW_SECONDS = 30
 # Keyring service name
 # ---------------------------------------------------------------------------
 KEYRING_SERVICE = "lolcoach"
+
+# ---------------------------------------------------------------------------
+# Build advisor — proactive update triggers
+# ---------------------------------------------------------------------------
+# Minimum seconds between AI-generated build updates (prevents spam during
+# rapid state changes like multiple enemies buying at the same time).
+BUILD_UPDATE_COOLDOWN = 45
+
+# Game phase thresholds (seconds)
+EARLY_GAME_END = 840      # 14 min
+MID_GAME_END = 1680       # 28 min

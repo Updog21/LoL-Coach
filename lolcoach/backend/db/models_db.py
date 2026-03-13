@@ -28,12 +28,10 @@ class MetaCache(SQLModel, table=True):
     champion: str = Field(index=True)
     role: str
     patch: str
+    source: str = Field(default="u.gg")  # u.gg | probuilds
     core_items: str  # JSON list of item names
     rune_page: str  # JSON
     win_rate: float
     pick_rate: float
+    pro_builds: Optional[str] = None  # JSON list of recent pro builds from probuilds.net
     updated_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
-
-    class Config:
-        # Composite uniqueness enforced at query level (upsert by champion+role+patch)
-        pass

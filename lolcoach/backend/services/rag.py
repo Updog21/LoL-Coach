@@ -6,7 +6,7 @@ import logging
 from typing import Optional
 
 import chromadb
-from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 from ..config import CHUNK_OVERLAP, CHUNK_SIZE, CHROMA_DIR, RAG_TOP_K
 from .ai_router import _get_embedding_model

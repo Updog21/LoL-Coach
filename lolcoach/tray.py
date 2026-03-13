@@ -73,7 +73,7 @@ def main() -> None:
 
         threading.Timer(1.5, _open_browser).start()
         icon.run()
-    except ImportError:
+    except Exception:
         logger.info("No tray support — running headless. Press Ctrl+C to quit.")
         _open_browser()
         try:

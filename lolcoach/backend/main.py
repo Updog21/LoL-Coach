@@ -18,8 +18,10 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from .config import CORS_ORIGIN, HOST, PORT
 from .db.database import init_db
-from .routers import ask, meta, resources, settings
+from .routers import ask, champ_select, meta, resources, settings
 from .security import get_or_create_token, require_token
+from .services.game_advisor import run_advisor
+from .services.lcu_poller import poll_lcu
 from .services.riot_poller import poll_riot_api
 from .ws.manager import ws_manager
 
@@ -60,18 +62,30 @@ async def lifespan(app: FastAPI):
     get_or_create_token()
     logger.info("Session token ready")
 
-    # Start Riot poller as background task
-    poller_task = asyncio.create_task(poll_riot_api())
+    # Start pollers and advisor as background tasks
+    riot_task = asyncio.create_task(poll_riot_api())
+    lcu_task = asyncio.create_task(poll_lcu())
+
+    # Game advisor reads current_game_state via a closure so it always
+    # gets the latest value from the riot poller module.
+    from .services import riot_poller
+    advisor_task = asyncio.create_task(
+        run_advisor(lambda: riot_poller.current_game_state)
+    )
+
     logger.info("Riot poller started")
+    logger.info("LCU poller started")
+    logger.info("Game advisor started")
 
     yield
 
     # Shutdown
-    poller_task.cancel()
-    try:
-        await poller_task
-    except asyncio.CancelledError:
-        pass
+    for task in (riot_task, lcu_task, advisor_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     logger.info("Shutdown complete")
 
 
@@ -105,6 +119,7 @@ def create_app() -> FastAPI:
 
     # Routers
     app.include_router(ask.router)
+    app.include_router(champ_select.router)
     app.include_router(resources.router)
     app.include_router(settings.router)
     app.include_router(meta.router)

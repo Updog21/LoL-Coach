@@ -35,16 +35,34 @@ def _transform_riot_payload(raw: dict) -> dict:
 
     # Second pass: split into allies/enemies
     for p in all_players:
+        # Extract rune data
+        runes_raw = p.get("runes", {})
+        scores_raw = p.get("scores", {})
+        runes = {
+            "keystone": runes_raw.get("keystone", {}).get("displayName", ""),
+            "primaryTree": runes_raw.get("primaryRuneTree", {}).get("displayName", ""),
+            "secondaryTree": runes_raw.get("secondaryRuneTree", {}).get("displayName", ""),
+        }
+
         slim = {
             "summonerName": p.get("summonerName", ""),
             "championName": p.get("championName", ""),
             "team": p.get("team", ""),
             "position": p.get("position", ""),
+            "level": p.get("level", 1),
             "isDead": p.get("isDead", False),
             "items": [
                 {"itemID": it.get("itemID", 0), "displayName": it.get("displayName", "")}
                 for it in p.get("items", [])
             ],
+            "runes": runes,
+            "scores": {
+                "kills": scores_raw.get("kills", 0),
+                "deaths": scores_raw.get("deaths", 0),
+                "assists": scores_raw.get("assists", 0),
+                "creepScore": scores_raw.get("creepScore", 0),
+                "wardScore": scores_raw.get("wardScore", 0.0),
+            },
         }
         if p.get("team") == my_team:
             allies.append(slim)
@@ -65,9 +83,27 @@ def _transform_riot_payload(raw: dict) -> dict:
     }
 
 
+def _inactive_game_payload() -> dict:
+    """Shape-compatible payload used to clear clients when a game ends."""
+    return {
+        "activePlayer": {
+            "summonerName": "",
+            "championName": "",
+            "level": 0,
+            "currentGold": 0.0,
+        },
+        "allies": [],
+        "enemies": [],
+        "gameTime": 0.0,
+        "gameMode": "",
+        "active": False,
+    }
+
+
 async def poll_riot_api() -> None:
     """Long-running coroutine: polls Riot API every RIOT_POLL_INTERVAL seconds."""
     global current_game_state
+    was_in_game = False
 
     async with httpx.AsyncClient(verify=False, timeout=3.0) as client:
         while True:
@@ -77,11 +113,18 @@ async def poll_riot_api() -> None:
                 transformed = _transform_riot_payload(resp.json())
                 current_game_state = GameState(**transformed)
                 await ws_manager.broadcast_json(current_game_state.model_dump(by_alias=True))
+                was_in_game = True
             except httpx.ConnectError:
                 # Game not running — normal condition
+                if was_in_game:
+                    await ws_manager.broadcast_json(_inactive_game_payload())
+                    was_in_game = False
                 current_game_state = None
             except Exception as exc:
                 logger.debug("Riot poller error: %s", exc)
+                if was_in_game:
+                    await ws_manager.broadcast_json(_inactive_game_payload())
+                    was_in_game = False
                 current_game_state = None
 
             await asyncio.sleep(RIOT_POLL_INTERVAL)
