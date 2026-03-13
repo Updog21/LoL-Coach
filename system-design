@@ -1,0 +1,342 @@
+# LoL Build Coach — Complete High Level Design
+**Version:** 1.0  |  **Date:** March 2026  |  **Author:** B
+
+---
+
+## 1. Overview
+
+LoL Build Coach is a locally installed Windows application that provides real-time,
+AI-powered item build recommendations for League of Legends. It reads live game state
+from the official Riot Live Client Data API, enriches it with current meta data and
+per-champion custom resources (YouTube guides, articles, PDFs), then queries an
+AI provider of the user's choice to generate contextual build advice.
+
+The UI is served as a local web application accessible at http://127.0.0.1:8765
+in the user's browser — no cloud backend, no hosting costs, no data leaving the
+machine except for AI API calls.
+
+---
+
+## 2. Requirements
+
+### Functional
+  FR-01  Recommend items, runes, and skill order based on live enemy comp and items
+  FR-02  Accept screenshot input — extract enemy champion/item data via AI vision
+  FR-03  Accept free-text questions (e.g. "what do I build vs heavy AP?")
+  FR-04  Ingest custom per-champion resources: YouTube, articles, PDFs, plain notes
+  FR-05  Custom resources influence AI answers with higher priority than generic meta
+  FR-06  Support multiple AI providers: OpenAI, Gemini, Anthropic, Ollama (local)
+  FR-07  Weekly automated meta refresh from u.gg / lolalytics
+  FR-08  Resource manager UI: add, view, delete resources per champion
+  FR-09  Settings UI: choose AI provider, enter API key securely
+  FR-10  System tray icon with "Open Dashboard" and "Quit" options
+  FR-11  Portable: all data stored in data/ folder next to the executable
+
+### Non-Functional
+  NFR-01  Must not trigger Riot Vanguard anti-cheat
+  NFR-02  Modern, dark-mode browser UI (React + shadcn/ui)
+  NFR-03  AI API keys never stored in plaintext — keyring or restricted files
+  NFR-04  Server binds to 127.0.0.1 only — unreachable from network
+  NFR-05  All endpoints authenticated — session token + constant-time comparison
+  NFR-06  Replay attack protection on AI calls (30s timestamp window)
+  NFR-07  Rate limiting: 10 req/min on /ask, 5 req/min on /resources
+  NFR-08  Single portable .exe — no installer, no Python or Node required
+  NFR-09  Responds to /ask within 5 seconds on a mid-range PC
+  NFR-10  ChromaDB data and settings persist in data/ folder across restarts
+
+---
+
+## 3. System Architecture
+
+### 3.1 Component Diagram
+
+  ┌────────────────────────────────────────────────────────────────────────────┐
+  │  lolcoach.exe  (PyInstaller bundle — portable, no install required)        │
+  │                                                                            │
+  │  ┌──────────────┐   ┌───────────────────────────────────────────────────┐ │
+  │  │ tray.py      │   │  FastAPI + Uvicorn  →  127.0.0.1:8765             │ │
+  │  │ pystray icon │   │                                                   │ │
+  │  │ Open Browser │   │  Middleware Stack                                 │ │
+  │  │ Quit         │   │  ├── Security Headers (CSP, X-Frame, nosniff)    │ │
+  │  └──────────────┘   │  ├── CORS (127.0.0.1:8765 only)                  │ │
+  │                     │  ├── Rate Limiter (slowapi)                       │ │
+  │                     │  └── Session Token Auth (all routes)              │ │
+  │                     │                                                   │ │
+  │                     │  Routers                                          │ │
+  │                     │  ├── GET  /bootstrap    (token delivery, no auth) │ │
+  │                     │  ├── WS   /ws           (live game state push)    │ │
+  │                     │  ├── POST /api/ask      (build recommendation)    │ │
+  │                     │  ├── *    /api/resources (CRUD resource manager)  │ │
+  │                     │  ├── *    /api/settings  (provider + API key)     │ │
+  │                     │  └── GET  /             (React SPA static files)  │ │
+  │                     │                                                   │ │
+  │                     │  Background Tasks (asyncio)                       │ │
+  │                     │  ├── Riot Poller  → polls :2999 every 5s          │ │
+  │                     │  └── Meta Scraper → u.gg/lolalytics weekly cron  │ │
+  │                     └───────────────────────────────────────────────────┘ │
+  │                                                                            │
+  │  ┌──────────────────────┐  ┌───────────────┐  ┌────────────────────────┐ │
+  │  ┌──────────────────────┐  ┌───────────────┐  ┌────────────────────────┐ │
+  │  │ ChromaDB             │  │ SQLite        │  │ Credential Store       │ │
+  │  │ Persistent           │  │ (SQLModel)    │  │ (keyring + fallback)   │ │
+  │  │ Per-champion         │  │ ├── settings  │  │ ├── openai_api_key     │ │
+  │  │ vector namespaces    │  │ ├── resources │  │ ├── gemini_api_key     │ │
+  │  │ ./data/chroma/       │  │ └── meta cache│  │ ├── anthropic_api_key  │ │
+  │  └──────────────────────┘  └───────────────┘  └────────────────────────┘ │
+  └────────────────────────────────────────────────────────────────────────────┘
+         ↕ loopback only                                    ↕ HTTPS outbound
+  ┌─────────────────────────┐                    ┌──────────────────────────┐
+  │ User's Browser          │                    │ External AI APIs         │
+  │ http://127.0.0.1:8765   │                    │ OpenAI  / GPT-4o         │
+  │ React + shadcn/ui       │                    │ Google  / Gemini 2.0     │
+  │ ├── Dashboard           │                    │ Anthropic / Claude 3.5   │
+  │ ├── Resource Manager    │                    │ Ollama (localhost:11434)  │
+  │ └── Settings            │                    └──────────────────────────┘
+  └─────────────────────────┘
+         ↕ loopback (verify=False — Riot self-signed cert)
+  ┌─────────────────────────┐
+  │ League of Legends       │
+  │ Riot Live Client API    │
+  │ https://127.0.0.1:2999  │
+  └─────────────────────────┘
+
+---
+
+## 4. Data Flow
+
+### 4.1 Live Game Flow (Real-Time)
+  1. Riot Poller (asyncio task) GETs /liveclientdata/allgamedata every 5s
+  2. Raw payload is sanitised → only activePlayer, allies, enemies, gameTime retained
+  3. Validated into GameState Pydantic model (strict, extra=forbid)
+  4. GameState broadcast to all connected browser WS clients
+  5. React dashboard renders live enemy comp + items automatically
+
+### 4.2 Build Recommendation Flow (/api/ask)
+  1. Browser sends POST /api/ask with:
+       { question, champion, role, gameState (optional), timestamp }
+  2. Middleware validates: session token → rate limit → timestamp window (30s)
+  3. RAG retrieval: ChromaDB similarity search on champion namespace
+       → top 3-5 chunks from custom resources (e.g. Lathyrus Bard video)
+  4. Meta lookup: SQLite query for champion+role win-rate build (latest patch)
+  5. Context bundle assembled:
+       [Live enemies + items] + [Meta build] + [RAG chunks]
+  6. LLM prompt constructed with priority instruction:
+       "Prefer user-provided resources over generic meta when they conflict"
+  7. AI API call (provider from settings, key from keyring)
+  8. Structured response returned: { items[], runes, skillOrder, rationale }
+
+### 4.3 Resource Ingestion Flow (/api/resources POST)
+  1. User submits { champion, url, label, type } from Resource Manager UI
+  2. URL validated (Pydantic HttpUrl) + champion name sanitised
+  3. Dispatcher routes by type:
+       YouTube  → youtube-transcript-api fetches transcript
+       Article  → httpx GET + BeautifulSoup text extraction
+       PDF      → PyMuPDF text extraction
+       Note     → raw text stored directly
+  4. LangChain RecursiveCharacterTextSplitter (chunk=500, overlap=50)
+  5. Chunks embedded via provider's embedding model
+  6. Stored in ChromaDB under champion namespace with metadata:
+       { source_url, label, champion, ingested_at, chunk_index }
+  7. Resource record written to SQLite (id, champion, url, label, type, status)
+
+### 4.4 Screenshot Flow
+  1. User pastes/drops screenshot onto dashboard
+  2. Browser encodes as base64, sends with POST /api/ask
+  3. Vision-capable model (GPT-4o / Gemini 2.0 Flash) extracts:
+       enemy champion names, their items, approximate gold
+  4. Extracted data merged into GameState and proceeds as 4.2
+
+### 4.5 Meta Refresh Flow (Weekly Cron)
+  1. APScheduler triggers every Monday 03:00 local time
+  2. httpx GETs champion build pages from u.gg (top win-rate builds per patch)
+  3. BeautifulSoup parses: core items, rune page, win rate, pick rate
+  4. Riot Data Dragon JSON fetched for latest patch item stats
+  5. SQLite meta table upserted — old entries for same champion+role+patch replaced
+  6. No external service — entirely local, no API key required
+
+---
+
+## 5. Security Model
+
+  Layer                  Mechanism                        Protects Against
+  ─────────────────────  ───────────────────────────────  ─────────────────────────────
+  Network binding        host=127.0.0.1 (never 0.0.0.0)  Remote network access
+  CORS policy            Allow-Origin: 127.0.0.1:8765     Cross-origin browser requests
+  Session token          32-byte URL-safe, file mode 600  Unauthenticated API calls
+  Token comparison       hmac.compare_digest (SHA-256)    Timing oracle attacks
+  Timestamp validation   ±30s window on /api/ask          Replay attacks
+  API key storage        keyring (+ file fallback)        Plaintext key exposure
+  Input validation       Pydantic extra=forbid + regex    Parameter pollution / injection
+  Rate limiting          slowapi 10/min ask, 5/min ingest Runaway AI API spend
+  Security headers       CSP, X-Frame-Options, nosniff    XSS, clickjacking, MIME
+  Logging policy         access_log=False, no key values  Token/key leakage in logs
+  OpenAPI disabled       docs_url=None, openapi_url=None  Schema reconnaissance
+  Vanguard safety        No injection, no overlay window  Anti-cheat detection
+
+---
+
+## 6. API Reference
+
+  Method   Path                     Auth    Rate Limit   Description
+  ───────  ───────────────────────  ──────  ───────────  ──────────────────────────
+  GET      /bootstrap               None    —            Deliver session token to SPA
+  WS       /ws?token=<t>            Token   —            Live game state stream
+  POST     /api/ask                 Token   10/min       Build recommendation
+  GET      /api/resources           Token   60/min       List resources (filter: ?champion=)
+  POST     /api/resources           Token   5/min        Ingest new resource
+  DELETE   /api/resources/{id}      Token   60/min       Remove resource + embeddings
+  GET      /api/settings            Token   60/min       Get provider (no raw key returned)
+  POST     /api/settings            Token   60/min       Set provider + save key to keyring
+  GET      /api/meta/status         Token   60/min       Last meta refresh time + patch
+  POST     /api/meta/refresh        Token   2/hour       Manually trigger meta refresh
+  GET      /                        None    —            React SPA (static)
+
+---
+
+## 7. Data Models
+
+  GameState
+  ├── activePlayer: { summonerName, championName, level, currentGold }
+  ├── allies:       [ PlayerSlim x5 ]
+  ├── enemies:      [ PlayerSlim x5 ]  ← primary input for build logic
+  ├── gameTime:     float (seconds)
+  └── gameMode:     str
+
+  PlayerSlim
+  ├── summonerName, championName, team, position, isDead
+  └── items: [ { id: int, name: str } x6 ]
+
+  AskRequest
+  ├── question:   str (max 500)
+  ├── champion:   str (max 32)
+  ├── role:       TOP | JUNGLE | MID | BOT | SUPPORT
+  ├── gameState:  GameState | None
+  └── timestamp:  ISO8601 (replay protection)
+
+  AddResourceRequest
+  ├── champion:   str (alphanumeric, lowercased)
+  ├── url:        HttpUrl
+  ├── label:      str (max 120)
+  └── type:       youtube | article | pdf | note
+
+  BuildResponse
+  ├── items:      [ { name, cost, reason } x6 ]
+  ├── runes:      { keystone, secondary, shards }
+  ├── skillOrder: str
+  └── rationale:  str (plain English, cites source if from custom resource)
+
+---
+
+## 8. Directory Structure
+
+  lolcoach/
+  ├── tray.py                        Entry point — tray icon + uvicorn thread
+  ├── requirements.txt
+  ├── data/                          Auto-created on first run (portable state)
+  │
+  ├── backend/
+  │   ├── main.py                    FastAPI app, middleware, CORS, lifespan
+  │   ├── config.py                  Paths, tunables, constants
+  │   ├── security.py                Token auth, keyring, replay protection
+  │   ├── models.py                  Pydantic models (strict, extra=forbid)
+  │   ├── routers/
+  │   │   ├── ask.py                 POST /api/ask
+  │   │   ├── resources.py           CRUD /api/resources
+  │   │   ├── settings.py            GET/POST /api/settings
+  │   │   └── meta.py                GET/POST /api/meta
+  │   ├── services/
+  │   │   ├── riot_poller.py         Async Riot Live Client API poller
+  │   │   ├── ai_router.py           Multi-provider LLM routing (LangChain)
+  │   │   ├── rag.py                 ChromaDB ingest + retrieval
+  │   │   ├── meta_scraper.py        u.gg scraper + Data Dragon sync
+  │   │   └── vision.py              Screenshot → enemy data extraction
+  │   ├── db/
+  │   │   ├── database.py            SQLite connection (SQLModel)
+  │   │   └── models_db.py           ORM models: Resource, Setting, MetaCache
+  │   └── ws/
+  │       └── manager.py             WebSocket broadcast manager
+  │
+  └── frontend/
+      ├── src/
+      │   ├── App.tsx
+      │   ├── components/
+      │   │   ├── Dashboard.tsx      Live game state + build output
+      │   │   ├── AskPanel.tsx       Text/screenshot query input
+      │   │   ├── ResourceManager.tsx Add/view/delete champion resources
+      │   │   └── Settings.tsx       Provider picker + API key entry
+      │   ├── hooks/
+      │   │   ├── useGameState.ts    WebSocket subscription
+      │   │   └── useAuth.ts         Bootstrap token + sessionStorage
+      │   └── lib/
+      │       └── api.ts             Typed fetch wrapper (attaches X-Session-Token)
+      ├── package.json               React + Vite + shadcn/ui + TanStack Query
+      └── dist/                      Built by: npm run build (served by FastAPI)
+
+---
+
+## 9. Tech Stack
+
+  Layer              Technology                  Reason
+  ─────────────────  ──────────────────────────  ─────────────────────────────────
+  Backend            FastAPI + Uvicorn            Async, fast, serves API + static
+  Real-time          WebSocket (FastAPI native)   Push game state without polling
+  AI routing         LangChain                   Provider-agnostic LLM interface
+  Embeddings         text-embedding-3-large       Best retrieval quality (OpenAI)
+  Vector store       ChromaDB PersistentClient    Embedded, no server, per-champion
+  Database           SQLite via SQLModel           Zero-config, local, typed ORM
+  Meta scraping      httpx + BeautifulSoup         Lightweight, no Selenium needed
+  Transcript ingest  youtube-transcript-api        Official captions, no yt-dlp
+  Scheduling         APScheduler                  In-process cron, no Celery needed
+  Credential store   keyring (+ file fallback)    OS-protected, never plaintext
+  Rate limiting      slowapi                      FastAPI-native, minimal config
+  Frontend           React + Vite + shadcn/ui     Modern, dark mode, zero overhead
+  State mgmt         TanStack Query               Server-state caching + WS sync
+  Tray               pystray + Pillow             Lightweight, no Qt dependency
+  Bundling           PyInstaller --onefile        Single portable .exe, no install
+
+---
+
+## 10. Build & Release (Portable)
+
+  Step  Command / Action
+  ────  ─────────────────────────────────────────────────────────────
+  1     cd frontend && npm install && npm run build
+        → outputs frontend/dist/ (served by FastAPI as static files)
+
+  2     pip install -r requirements.txt
+        pyinstaller --onefile --noconsole --name lolcoach tray.py
+        → outputs dist/lolcoach.exe (~120MB bundled)
+
+  3     Distribute lolcoach.exe — user drops it anywhere and runs it.
+        No installer, no service, no registry changes.
+
+  4     On first launch:
+          - data/ folder created next to lolcoach.exe
+          - .token generated (mode 600)
+          - SQLite DB initialised in data/lolcoach.db
+          - ChromaDB persisted in data/chroma/
+          - Browser opens to http://127.0.0.1:8765/?autoAuth=1
+
+---
+
+## 11. What Is and Is NOT Built Yet
+
+  Component                     Status
+  ────────────────────────────  ──────────────────────────────────────────
+  FastAPI skeleton              ✅ Complete (main, config, security, models)
+  WebSocket manager             ✅ Complete
+  Riot poller                   ✅ Complete
+  Session token auth            ✅ Complete
+  Keyring API key storage       ✅ Complete
+  Replay protection             ✅ Complete
+  Security headers + CORS       ✅ Complete
+  Rate limiting                 ✅ Complete
+  Routers (ask/resources/etc)   ✅ Complete (full business logic)
+  ai_router.py (LLM routing)    ✅ Complete
+  rag.py (ChromaDB pipeline)    ✅ Complete
+  vision.py (screenshot parse)  ✅ Complete
+  meta_scraper.py               ✅ Complete
+  resource_ingestor.py          ✅ Complete
+  SQLite DB + ORM models        ✅ Complete
+  Portable data directory       ✅ Complete (data/ next to exe)
+  React frontend                🔲 Next
