@@ -1,0 +1,24 @@
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+
+# Packaging / build outputs
+build/
+dist/
+*.egg-info/
+
+# PyInstaller artifacts
+*.spec
+
+# Frontend build output
+frontend/dist/
+lolcoach/frontend/dist/
+
+# Nested package build outputs
+lolcoach/build/
+lolcoach/dist/
+
+# Local runtime data
+data/
+lolcoach/data/
+
